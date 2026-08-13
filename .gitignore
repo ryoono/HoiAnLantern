@@ -1,0 +1,16 @@
+# MPLAB X generated files
+build/
+dist/
+.generated_files/
+
+# Machine-specific MPLAB X settings
+nbproject/private/
+
+# Auto-generated makefiles
+nbproject/Makefile-*.mk
+nbproject/Package-*.bash
+nbproject/Package-*.bat
+
+# Windows
+Thumbs.db
+Desktop.ini
