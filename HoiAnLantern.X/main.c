@@ -27,9 +27,10 @@
  * 2SK4017 Gate-GND : 100kR pull-down
  *
  * LED:
- * +4.5V -> current limiting resistor(75ohm)
- *       -> LED(OSM2DK5111A-UV)
- *       -> 2SK4017 Drain
+ * +4.5V
+ *   -> current limiting resistor (75ohm)
+ *   -> LED (OSM2DK5111A-UV)
+ *   -> 2SK4017 Drain
  *
  * 2SK4017 Source -> GND
  *
@@ -60,6 +61,15 @@
  *   炎そのものの強弱を表現する。
  *
  *
+ * 最終出力:
+ *
+ *   gamma補正後の輝度にOUTPUT_GAINを掛け、
+ *   現在の揺らぎの形を保ったまま最大輝度を引き上げる。
+ *
+ *   255を超えた場合は255へ飽和させるため、
+ *   PWM Dutyは100%を超えない。
+ *
+ *
  * LEDの揺らぎ生成部分は以下の記事で紹介されている
  * 間欠カオスを用いた手法をベースにしている。
  *
@@ -74,6 +84,10 @@
  * ・CPUは待機中Idleモードへ移行
  * ・不要な周辺モジュールをPMDで停止
  * ・逆相揺らぎとは独立した全体輝度用カオスを追加
+ * ・最終出力ゲインを追加
+ * ・出力ゲイン計算時はuint32_tを使用して
+ *   16bitオーバーフローを防止
+ * ・100%を超える場合は255へ飽和
  *
  * ============================================================
  */
@@ -101,7 +115,6 @@
 // 外部クロックを使わないのでFail-Safe Clock Monitorは不要
 #pragma config FCMEN = OFF
 
-
 // MCLRを有効化
 #pragma config MCLRE = ON
 
@@ -125,7 +138,6 @@
 
 // デバッグ機能OFF
 #pragma config DEBUG = OFF
-
 
 // Low Voltage Programming有効
 #pragma config LVP = ON
@@ -152,12 +164,6 @@
  * LED1 / LED2間の逆相揺らぎの深さ
  * ------------------------------------------------------------
  *
- * 元Arduino版:
- *
- *   dimming_range = 50
- *
- * と同じ。
- *
  * FLICKER_DEPTH = 50 の場合、
  *
  * CH1:
@@ -167,16 +173,13 @@
  *   255 ～ 205
  *
  * の範囲で逆方向に変化する。
- *
- * 大きくすると、
- * 2つのLED間の明暗差が大きくなる。
  */
 #define FLICKER_DEPTH              50u
 
 
 /*
  * ------------------------------------------------------------
- * ランタン全体の揺らぎの最小輝度
+ * ランタン全体の揺らぎ範囲
  * ------------------------------------------------------------
  *
  * Q8形式:
@@ -185,28 +188,40 @@
  * 230 = 約90%
  * 205 = 約80%
  * 180 = 約70%
- * 154 = 約60%
  *
- * 初期設定では、
+ * 初期設定:
  *
  *   約70% ～ 100%
- *
- * の範囲でランタン全体を揺らす。
- *
- * 暗すぎる場合:
- *   190～210程度へ上げる。
- *
- * 揺らぎが弱い場合:
- *   160～170程度へ下げる。
  */
 #define GLOBAL_BRIGHTNESS_MIN_Q8   180u
+#define GLOBAL_BRIGHTNESS_MAX_Q8   256u
+
 
 /*
- * 全体揺らぎの最大輝度。
+ * ------------------------------------------------------------
+ * 出力ゲイン
+ * ------------------------------------------------------------
  *
- * 256 = 100%
+ * gamma補正後の輝度を約1.098倍する。
+ *
+ * 281 / 256
+ *
+ *   ≒ 1.09765625
+ *
+ * 理論上255を超える場合があるため、
+ * applyOutputGain()内で255へ飽和させる。
+ *
+ * 乗算にはuint32_tを使用する。
+ *
+ * 最大:
+ *
+ *   255 * 281
+ *   = 71655
+ *
+ * これはuint16_tの最大65535を超えるため、
+ * uint16_tで計算してはいけない。
  */
-#define GLOBAL_BRIGHTNESS_MAX_Q8   256u
+#define OUTPUT_GAIN_Q8             281u
 
 
 /*
@@ -214,15 +229,12 @@
  * 全体の最大明るさ
  * ------------------------------------------------------------
  *
+ * OUTPUT_GAIN適用後に使用する。
+ *
  * 256 = 100%
  * 192 =  75%
  * 128 =  50%
  *  64 =  25%
- *
- * 電池寿命を延ばすなら、
- * PIC側の省電力化よりこの値を下げる方が圧倒的に効く。
- *
- * 最初は100%で実物を確認する。
  */
 #define MASTER_BRIGHTNESS_Q8       256u
 
@@ -247,14 +259,10 @@
 
 
 /*
- * ------------------------------------------------------------
  * 擬似乱数初期値
- * ------------------------------------------------------------
  *
- * 2個のランタンに完全に同じプログラムを書き込むと、
- * 同時起動時に同じ揺らぎになる可能性がある。
- *
- * 2台目ではこの値を変更するとよい。
+ * 2個のランタンに同じプログラムを書き込む場合は、
+ * 2台目で変更すると揺らぎが一致しにくくなる。
  */
 #define RNG_SEED                   0xA531u
 
@@ -263,11 +271,6 @@
 // Gamma correction table
 // ============================================================
 
-/*
- * 人間の目の明るさ感覚に合わせるためのgamma補正。
- *
- * 元Arduino版と同じテーブルを使用する。
- */
 static const uint8_t gamma8[256] = {
 
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -325,17 +328,7 @@ static const uint8_t gamma8[256] = {
 // ============================================================
 
 /*
- * ------------------------------------------------------------
- * 逆相揺らぎ用の間欠カオス内部値
- * ------------------------------------------------------------
- *
- * Q15形式:
- *
- * 0     = 0.0
- * 16384 = 0.5
- * 32768 = 1.0
- *
- * 初期値:
+ * 逆相揺らぎ用の間欠カオス内部値。
  *
  * 3277 / 32768 ≒ 0.10
  */
@@ -343,16 +336,12 @@ static uint16_t chaosValue = 3277u;
 
 
 /*
- * ------------------------------------------------------------
- * 全体輝度用の間欠カオス内部値
- * ------------------------------------------------------------
- *
- * 逆相カオスとは異なる初期状態から開始する。
+ * 全体輝度用の間欠カオス内部値。
  *
  * 10923 / 32768 ≒ 0.333
  *
- * 初期値をずらすことで、
- * 2つの揺らぎが同期しにくくなる。
+ * 逆相側とは異なる値から開始することで
+ * 同期しにくくする。
  */
 static uint16_t globalChaosValue = 10923u;
 
@@ -360,7 +349,7 @@ static uint16_t globalChaosValue = 10923u;
 /*
  * PWMの目標Duty。
  *
- * PIC16F18313のPWMは10bit。
+ * 10bit:
  *
  * 0 ～ 1023
  */
@@ -375,28 +364,11 @@ static uint16_t rngState = RNG_SEED;
 
 
 /*
- * Timer2割り込み1回を1 tickとする。
- *
- * 今回:
- *
- * PWM周期     ≒ 1.024ms
- * Postscaler  = 1:16
- *
- * したがって
+ * Timer2 interrupt:
  *
  * 1 tick ≒ 16.384ms
  */
-
-
-/*
- * 逆相揺らぎの次回更新までのtick数。
- */
 static uint8_t updateTicks = 1u;
-
-
-/*
- * 全体輝度揺らぎの次回更新までのtick数。
- */
 static uint8_t globalUpdateTicks = 1u;
 
 
@@ -412,14 +384,6 @@ static uint8_t fadeTicks = 0u;
 // Pseudo random generator
 // ============================================================
 
-/*
- * 16bit xorshift
- *
- * Arduinoのrandom()の代わりとして使用。
- *
- * 暗号用途ではなく、
- * LEDの揺らぎ周期を少し乱すだけなので十分。
- */
 static uint16_t rand16(void)
 {
     uint16_t x = rngState;
@@ -430,8 +394,7 @@ static uint16_t rand16(void)
 
 
     /*
-     * xorshiftは0が永久に0になるため、
-     * 念のため0を回避する。
+     * xorshiftは0になると永久に0なので回避する。
      */
     if (x == 0u) {
         x = 0xA531u;
@@ -448,20 +411,8 @@ static uint16_t rand16(void)
 // PPS control
 // ============================================================
 
-/*
- * Peripheral Pin Selectのロック解除。
- *
- * PIC16F18313ではPWM出力をRA4/RA5へ割り当てるために
- * PPS設定が必要。
- */
 static void unlockPPS(void)
 {
-    /*
-     * PPS変更シーケンス中は割込み禁止。
-     *
-     * 今回はもともとGIE=0で運用するが、
-     * 明示的に0へする。
-     */
     INTCONbits.GIE = 0;
 
     PPSLOCK = 0x55;
@@ -471,9 +422,6 @@ static void unlockPPS(void)
 }
 
 
-/*
- * PPSを再ロックする。
- */
 static void lockPPS(void)
 {
     PPSLOCK = 0x55;
@@ -487,29 +435,18 @@ static void lockPPS(void)
 // PWM register access
 // ============================================================
 
-/*
- * PWM5 duty設定。
- *
- * duty10:
- *
- *   0 ～ 1023
- */
 static void writePWM5(uint16_t duty10)
 {
+    /*
+     * 念のため10bit最大値で飽和させる。
+     */
     if (duty10 > 1023u) {
         duty10 = 1023u;
     }
 
 
-    /*
-     * PWM5DC[9:2]
-     */
     PWM5DCH = (uint8_t)(duty10 >> 2);
 
-
-    /*
-     * PWM5DC[1:0]はDCLのbit7:6に格納
-     */
     PWM5DCL =
         (uint8_t)(
             (duty10 & 0x03u)
@@ -519,11 +456,11 @@ static void writePWM5(uint16_t duty10)
 }
 
 
-/*
- * PWM6 duty設定。
- */
 static void writePWM6(uint16_t duty10)
 {
+    /*
+     * 念のため10bit最大値で飽和させる。
+     */
     if (duty10 > 1023u) {
         duty10 = 1023u;
     }
@@ -545,24 +482,21 @@ static void writePWM6(uint16_t duty10)
 // ============================================================
 
 /*
- * 8bit brightness:
+ * 8bit:
  *
  *   0 ～ 255
  *
  * を
  *
- * PWM 10bit:
+ * 10bit:
  *
  *   0 ～ 1023
  *
- * に変換する。
+ * へ変換する。
  *
- * 上位8bitをそのまま使用し、
- * 上位側のbitを下位2bitにも複製することで、
+ * 255 -> 1023
  *
- *   255 -> 1023
- *
- * になる。
+ * なのでPWM Duty 100%となる。
  */
 static uint16_t brightnessToDuty10(uint8_t brightness)
 {
@@ -582,20 +516,78 @@ static uint16_t brightnessToDuty10(uint8_t brightness)
 
 
 /*
+ * ------------------------------------------------------------
+ * OUTPUT_GAIN
+ * ------------------------------------------------------------
+ *
+ * gamma補正後の輝度を約1.098倍する。
+ *
+ * uint32_tを使用することで
+ *
+ *   255 * 281 = 71655
+ *
+ * の計算でもオーバーフローしない。
+ *
+ * 255を超えた場合は255へ飽和する。
+ *
+ * これにより一部のピークではPWMが100%に張り付く。
+ */
+static uint8_t applyOutputGain(uint8_t brightness)
+{
+    uint32_t temp;
+
+
+    temp =
+        (uint32_t)brightness
+        *
+        (uint32_t)OUTPUT_GAIN_Q8;
+
+
+    /*
+     * Q8なので256で除算。
+     */
+    temp >>= 8;
+
+
+    /*
+     * 8bit最大輝度へ飽和。
+     *
+     * ここで255を超えないことを保証する。
+     */
+    if (temp > 255UL) {
+        temp = 255UL;
+    }
+
+
+    return (uint8_t)temp;
+}
+
+
+/*
  * MASTER_BRIGHTNESSを適用する。
  *
- * MASTER_BRIGHTNESS_Q8 = 256
+ * OUTPUT_GAIN適用後は0～255であることが
+ * applyOutputGain()によって保証される。
  *
- * のとき入力値をそのまま返す。
+ * MASTER_BRIGHTNESS_Q8 <= 256で使用する限り、
+ *
+ * 最大:
+ *
+ *   255 * 256
+ *   = 65280
+ *
+ * なのでuint16_tに収まる。
  */
 static uint8_t applyMasterBrightness(uint8_t brightness)
 {
     uint16_t temp;
 
+
     temp =
         (uint16_t)brightness
         *
         (uint16_t)MASTER_BRIGHTNESS_Q8;
+
 
     return
         (uint8_t)(
@@ -610,34 +602,6 @@ static uint8_t applyMasterBrightness(uint8_t brightness)
 // Brightness calculation
 // ============================================================
 
-/*
- * 2種類の間欠カオスからLED輝度を求める。
- *
- *
- * chaosValue:
- *
- *   LED CH1 / CH2の逆相揺らぎ。
- *
- *
- * globalChaosValue:
- *
- *   ランタン全体の明暗揺らぎ。
- *
- *
- * 処理順:
- *
- *  1. chaosValueからCH1/CH2の逆相輝度を求める
- *
- *  2. globalChaosValueから全体輝度係数を求める
- *
- *  3. 2灯に同じ全体輝度係数を掛ける
- *
- *  4. gamma補正
- *
- *  5. MASTER_BRIGHTNESS
- *
- *  6. PWM Dutyへ変換
- */
 static void calculateBrightness(void)
 {
     uint16_t delta;
@@ -658,14 +622,16 @@ static void calculateBrightness(void)
      *
      * LED1 / LED2の逆相揺らぎ
      * ========================================================
-     *
+     */
+
+    /*
      * chaosValue:
      *
-     *   0 ～ 32768
+     * 0 ～ 32768
      *
      * を
      *
-     *   0 ～ FLICKER_DEPTH
+     * 0 ～ FLICKER_DEPTH
      *
      * に変換する。
      */
@@ -682,34 +648,12 @@ static void calculateBrightness(void)
 
 
     /*
-     * 元Arduino版:
+     * CH1 / CH2を逆方向へ変化させる。
      *
-     * value_1 =
-     *   255 - dimming_range
-     *   + value * dimming_range;
+     * FLICKER_DEPTH = 50:
      *
-     * value_2 =
-     *   255
-     *   - value * dimming_range;
-     *
-     * と同じ。
-     *
-     *
-     * FLICKER_DEPTH = 50の場合:
-     *
-     * raw5:
-     *
-     *   205 ～ 255
-     *
-     * raw6:
-     *
-     *   255 ～ 205
-     *
-     * となる。
-     *
-     * 2灯の合計は一定なので、
-     * この段階ではランタン全体の光量は
-     * ほぼ一定となる。
+     * CH1 = 205 ～ 255
+     * CH2 = 255 ～ 205
      */
     raw5 =
         (uint8_t)(
@@ -735,28 +679,8 @@ static void calculateBrightness(void)
      *
      * ランタン全体の明暗揺らぎ
      * ========================================================
-     *
-     * globalChaosValue:
-     *
-     *   0 ～ 32768
-     *
-     * を
-     *
-     * GLOBAL_BRIGHTNESS_MIN_Q8
-     *
-     *       ～
-     *
-     * GLOBAL_BRIGHTNESS_MAX_Q8
-     *
-     * に変換する。
-     *
-     *
-     * 初期設定:
-     *
-     *   180 ～ 256
-     *
-     *   ≒ 70 ～ 100%
      */
+
     globalRange =
         (uint16_t)(
             GLOBAL_BRIGHTNESS_MAX_Q8
@@ -765,6 +689,14 @@ static void calculateBrightness(void)
         );
 
 
+    /*
+     * 32bitで乗算。
+     *
+     * globalChaosValue <= 32768
+     * globalRange      = 76
+     *
+     * 最大でも約2.5Mなのでuint32_tには十分収まる。
+     */
     globalBrightnessQ8 =
         (uint16_t)(
             GLOBAL_BRIGHTNESS_MIN_Q8
@@ -782,17 +714,16 @@ static void calculateBrightness(void)
 
 
     /*
-     * 逆相関係を維持したまま、
-     * CH1 / CH2の両方に
-     * 同じ全体輝度係数を掛ける。
+     * CH1 / CH2へ同じ倍率を掛けることで、
+     * 逆相関係を維持したまま
+     * ランタン全体を明暗させる。
      *
-     * globalBrightnessQ8 = 256:
+     * 最大:
      *
-     *   100%
+     *   255 * 256
+     *   = 65280
      *
-     * globalBrightnessQ8 = 180:
-     *
-     *   約70%
+     * だが、計算は安全側でuint32_tを使用。
      */
     raw5 =
         (uint8_t)(
@@ -826,14 +757,32 @@ static void calculateBrightness(void)
 
 
     /*
-     * 全体の最大輝度設定を反映
+     * --------------------------------------------------------
+     * 出力ゲイン
+     * --------------------------------------------------------
+     *
+     * 約1.098倍する。
+     *
+     * 255を超える場合はapplyOutputGain()内部で
+     * 255へ飽和する。
+     *
+     * したがってPWM100%を超えることはない。
+     */
+    gamma5 = applyOutputGain(gamma5);
+    gamma6 = applyOutputGain(gamma6);
+
+
+    /*
+     * MASTER_BRIGHTNESS
+     *
+     * 現在は256 = 100%
      */
     gamma5 = applyMasterBrightness(gamma5);
     gamma6 = applyMasterBrightness(gamma6);
 
 
     /*
-     * 8bit -> 10bit PWMへ変換
+     * 8bit -> 10bit PWM
      */
     targetDuty5 = brightnessToDuty10(gamma5);
     targetDuty6 = brightnessToDuty10(gamma6);
@@ -844,39 +793,6 @@ static void calculateBrightness(void)
 // Intermittent chaos
 // ============================================================
 
-/*
- * 間欠カオスの状態を1ステップ進める。
- *
- * value:
- *
- * Q15形式:
- *
- * 0     = 0.0
- * 16384 = 0.5
- * 32768 = 1.0
- *
- *
- * 元Arduino版:
- *
- * if (value < 0.5) {
- *
- *     value +=
- *         2 * value * value;
- * }
- * else {
- *
- *     value -=
- *         2 * (1-value) * (1-value);
- * }
- *
- *
- * この関数を、
- *
- * ・逆相揺らぎ
- * ・全体輝度揺らぎ
- *
- * の両方から使用する。
- */
 static void advanceChaos(uint16_t *value)
 {
     uint32_t square;
@@ -891,15 +807,13 @@ static void advanceChaos(uint16_t *value)
         /*
          * value += 2 * value^2
          *
-         * Q15なので、
+         * Q15:
          *
          * 2*x*x / 32768
          *
          * =
          *
          * x*x / 16384
-         *
-         * となる。
          */
         square =
             (uint32_t)x
@@ -946,8 +860,8 @@ static void advanceChaos(uint16_t *value)
 
 
     /*
-     * 0または1付近まで来ると周期性が強くなるため、
-     * thresholdを超えたところで乱数を再注入する。
+     * 0または1付近まで来た場合、
+     * 乱数を再注入する。
      */
     if (
         (x <= CHAOS_THRESHOLD)
@@ -974,6 +888,13 @@ static void advanceChaos(uint16_t *value)
             );
 
 
+        /*
+         * rand16()最大65535
+         *
+         * range ≒ 28508
+         *
+         * 積は約1.87e9なのでuint32_tに収まる。
+         */
         x =
             CHAOS_THRESHOLD
             +
@@ -1001,34 +922,20 @@ static void advanceChaos(uint16_t *value)
  * ------------------------------------------------------------
  * Chaos 1
  *
- * LED1 / LED2逆相揺らぎの更新時間
+ * LED1 / LED2逆相揺らぎ
  * ------------------------------------------------------------
- *
- * Timer2 interrupt tick:
- *
- * 約16.384ms
- *
  *
  * 基本:
  *
- * 5～8 tick
+ * 5 ～ 8 tick
  *
- * ≒ 82～131ms
+ * 約82 ～ 131ms
  *
+ * 約1/3の確率で
  *
- * さらに約1/3の確率で
- * 数tick追加する。
+ * +3 ～ +10 tick
  *
- *
- * 元Arduino版の
- *
- * 80～125ms
- *
- * と
- *
- * 時々 +40～140ms
- *
- * を近似している。
+ * を追加する。
  */
 static uint8_t getNextUpdateTicks(void)
 {
@@ -1039,9 +946,6 @@ static uint8_t getNextUpdateTicks(void)
     r = rand16();
 
 
-    /*
-     * 5 ～ 8 tick
-     */
     ticks =
         (uint8_t)(
             5u
@@ -1050,10 +954,6 @@ static uint8_t getNextUpdateTicks(void)
         );
 
 
-    /*
-     * およそ1/3の確率で
-     * 少し長く停止させる。
-     */
     if (
         (uint8_t)(
             rand16()
@@ -1064,11 +964,6 @@ static uint8_t getNextUpdateTicks(void)
         85u
     ) {
 
-        /*
-         * +3 ～ +10 tick
-         *
-         * 約49～164ms追加
-         */
         ticks +=
             (uint8_t)(
                 3u
@@ -1086,41 +981,28 @@ static uint8_t getNextUpdateTicks(void)
  * ------------------------------------------------------------
  * Chaos 2
  *
- * ランタン全体の明暗更新時間
+ * ランタン全体の明暗揺らぎ
  * ------------------------------------------------------------
- *
- * Timer2 interrupt tick:
- *
- * 約16.384ms
- *
  *
  * 基本:
  *
- * 4～7 tick
+ * 4 ～ 7 tick
  *
- * ≒ 66～115ms
+ * 約66 ～ 115ms
  *
+ * 約1/4の確率で
  *
- * 約1/4の確率で:
+ * +2 ～ +5 tick
  *
- * +2～5 tick
+ * 約33 ～ 82ms
  *
- * ≒ 33～82ms追加
- *
+ * を追加する。
  *
  * 最大:
  *
  * 12 tick
  *
- * ≒ 197ms
- *
- *
- * 1回の更新が1つの山・谷ではなく、
- * 間欠カオスの状態が複数回連続して変化することで
- * 短い山と谷が形成される。
- *
- * 逆相揺らぎとは別のタイミングで更新するため、
- * 2つの揺らぎは同期しない。
+ * 約197ms
  */
 static uint8_t getNextGlobalUpdateTicks(void)
 {
@@ -1131,9 +1013,6 @@ static uint8_t getNextGlobalUpdateTicks(void)
     r = rand16();
 
 
-    /*
-     * 4 ～ 7 tick
-     */
     ticks =
         (uint8_t)(
             4u
@@ -1142,10 +1021,6 @@ static uint8_t getNextGlobalUpdateTicks(void)
         );
 
 
-    /*
-     * 約1/4の確率で
-     * 少し長くその明るさを保持する。
-     */
     if (
         (uint8_t)(
             rand16()
@@ -1156,11 +1031,6 @@ static uint8_t getNextGlobalUpdateTicks(void)
         64u
     ) {
 
-        /*
-         * +2 ～ +5 tick
-         *
-         * 約33～82ms追加
-         */
         ticks +=
             (uint8_t)(
                 2u
@@ -1178,14 +1048,6 @@ static uint8_t getNextGlobalUpdateTicks(void)
 // Peripheral Module Disable
 // ============================================================
 
-/*
- * 使用しない周辺回路へのクロック供給を停止する。
- *
- * PWM5 / PWM6 / Timer2だけは残す。
- *
- * 消費電流への寄与はLEDに比べれば小さいが、
- * バッテリ機器なので不要なものは止めておく。
- */
 static void disableUnusedPeripherals(void)
 {
     /*
@@ -1199,9 +1061,7 @@ static void disableUnusedPeripherals(void)
 
 
     /*
-     * NCO、Timer0、Timer1停止。
-     *
-     * Timer2はPWMに必要なので有効のまま。
+     * Timer2のみ使用。
      */
     PMD1bits.NCOMD  = 1;
     PMD1bits.TMR0MD = 1;
@@ -1218,9 +1078,7 @@ static void disableUnusedPeripherals(void)
 
 
     /*
-     * PWM5 / PWM6は使用する。
-     *
-     * CCP、CWGは不要。
+     * PWM5 / PWM6のみ使用。
      */
     PMD3bits.CWG1MD = 1;
 
@@ -1254,7 +1112,7 @@ static void disableUnusedPeripherals(void)
 static void initGPIO(void)
 {
     /*
-     * PORTAをすべてデジタルとして使用。
+     * PORTAをすべてデジタル。
      */
     ANSELA = 0x00;
 
@@ -1272,22 +1130,19 @@ static void initGPIO(void)
 
 
     /*
-     * 出力LatchをLOWへしておく。
+     * 出力LatchをLOW。
      */
     LATA = 0x00;
 
 
     /*
-     * PWM初期化中はRA4 / RA5を入力にして、
-     * LEDが不用意に点灯しないようにする。
+     * PWM初期化中はRA4 / RA5を入力にする。
      *
      * RA3 : MCLR
      * RA4 : input temporarily
      * RA5 : input temporarily
      *
-     * RA0 / RA1 / RA2はLOW出力。
-     *
-     * RA0/RA1はICSP時にはプログラマ側が制御する。
+     * RA0 / RA1 / RA2 : LOW output
      */
     TRISA = 0x38;
 }
@@ -1300,9 +1155,7 @@ static void initGPIO(void)
 static void initPWM(void)
 {
     /*
-     * PWM5 / PWM6を一旦停止。
-     *
-     * 出力極性はactive-high。
+     * PWM5 / PWM6停止。
      */
     PWM5CON = 0x00;
     PWM6CON = 0x00;
@@ -1332,12 +1185,7 @@ static void initPWM(void)
      *
      * =>
      *
-     * 1,000,000 /
-     * (4 * 256)
-     *
-     * ≒ 976.56 Hz
-     *
-     * PR2=255なので10bit PWMを最大限使用できる。
+     * 約976.56Hz
      */
 
 
@@ -1345,36 +1193,19 @@ static void initPWM(void)
     TMR2 = 0u;
 
 
-    /*
-     * Timer2 interrupt flag clear
-     */
     PIR1bits.TMR2IF = 0;
 
 
     /*
-     * T2CON
-     *
-     * bit6:3 T2OUTPS = 1111
-     *                  Postscaler 1:16
-     *
-     * bit2 TMR2ON    = 1
-     *
-     * bit1:0 T2CKPS  = 00
-     *                  Prescaler 1:1
-     *
-     * 0111 1100 = 0x7C
+     * T2OUTPS = 1:16
+     * TMR2ON  = 1
+     * T2CKPS  = 1:1
      */
     T2CON = 0x7C;
 
 
     /*
-     * 最初のTimer2周期が完了するまで待つ。
-     *
-     * Datasheet推奨のPWM初期化手順。
-     *
-     * Postscalerが1:16なので
-     * 約16ms待つことになるが、
-     * 起動時だけなので問題ない。
+     * 最初のTimer2周期完了を待つ。
      */
     while (PIR1bits.TMR2IF == 0) {
         ;
@@ -1389,17 +1220,12 @@ static void initPWM(void)
      * PPS
      * ========================================================
      *
-     * PIC16F18313:
-     *
-     * PPS output source
-     *
      * 0x02 = PWM5
      * 0x03 = PWM6
      *
      * RA4 <- PWM5
      * RA5 <- PWM6
      */
-
     unlockPPS();
 
     RA4PPS = 0x02;
@@ -1409,7 +1235,7 @@ static void initPWM(void)
 
 
     /*
-     * PWM module enable。
+     * PWM enable
      */
     PWM5CONbits.PWM5EN = 1;
     PWM6CONbits.PWM6EN = 1;
@@ -1423,24 +1249,21 @@ static void initPWM(void)
 
 
     /*
-     * Timer2 interruptをIdle解除用として使用する。
+     * Timer2 interruptを
+     * Idle解除用として使用する。
      */
     PIR1bits.TMR2IF = 0;
     PIE1bits.TMR2IE = 1;
 
 
-    /*
-     * Peripheral Interrupt Enable
-     */
     INTCONbits.PEIE = 1;
 
 
     /*
-     * GIEは0のまま。
+     * GIEは0。
      *
-     * これによりTimer2 interrupt requestでIdleから復帰するが、
-     * ISRへは飛ばず、
-     * SLEEP()の次の命令から処理を再開する。
+     * Timer2 interrupt requestによって
+     * Idleから復帰するがISRへは飛ばない。
      */
     INTCONbits.GIE = 0;
 }
@@ -1453,13 +1276,10 @@ static void initPWM(void)
 static void initIdle(void)
 {
     /*
-     * IDLEN = 1
+     * SLEEP時にFull SleepではなくIdleへ移行する。
      *
-     * SLEEP命令実行時、
-     * Full SleepではなくIdleへ移行する。
-     *
-     * CPUとProgram Memoryは停止するが、
-     * Timer2とPWMは継続動作する。
+     * CPUは停止するが、
+     * Timer2 / PWMは動作を続ける。
      */
     CPUDOZEbits.IDLEN = 1;
 }
@@ -1475,50 +1295,45 @@ void main(void)
 
 
     /*
-     * GPIO初期化。
+     * GPIO初期化
      */
     initGPIO();
 
 
     /*
-     * 不要な周辺回路を停止。
+     * 未使用周辺回路停止
      */
     disableUnusedPeripherals();
 
 
     /*
-     * 初期の明るさを計算。
-     *
-     * chaosValueとglobalChaosValueの
-     * 両方の初期値がここで反映される。
+     * 初期輝度計算
      */
     calculateBrightness();
 
 
     /*
-     * PWM初期化。
+     * PWM初期化
      */
     initPWM();
 
 
     /*
-     * 逆相揺らぎの
-     * 次回更新タイミングを決定。
+     * 逆相カオスの次回更新時間
      */
     updateTicks =
         getNextUpdateTicks();
 
 
     /*
-     * 全体輝度揺らぎの
-     * 次回更新タイミングを決定。
+     * 全体カオスの次回更新時間
      */
     globalUpdateTicks =
         getNextGlobalUpdateTicks();
 
 
     /*
-     * Idle使用開始。
+     * Idle有効
      */
     initIdle();
 
@@ -1532,36 +1347,22 @@ void main(void)
     while (1) {
 
         /*
-         * ----------------------------------------------------
-         * CPUをIdleへ
-         * ----------------------------------------------------
+         * CPUをIdleへ。
          *
-         * Timer2 / PWMはハードウェアで動作し続ける。
-         *
-         * 約16.4ms後、
-         * Timer2 interrupt requestによって
-         * CPUが再開する。
+         * 約16.4ms後にTimer2で復帰する。
          */
         SLEEP();
         NOP();
 
 
         /*
-         * Timer2 interrupt flagをクリア。
+         * Timer2 interrupt flag clear
          */
         if (PIR1bits.TMR2IF) {
             PIR1bits.TMR2IF = 0;
         }
 
 
-        /*
-         * このtickで、
-         *
-         * ・逆相カオス
-         * ・全体カオス
-         *
-         * のどちらかが変化したかを示す。
-         */
         brightnessChanged = 0u;
 
 
@@ -1580,17 +1381,9 @@ void main(void)
 
         if (updateTicks == 0u) {
 
-            /*
-             * LED1 / LED2の逆相カオスを
-             * 1ステップ進める。
-             */
             advanceChaos(&chaosValue);
 
 
-            /*
-             * 次の更新タイミングを
-             * ランダムに設定。
-             */
             updateTicks =
                 getNextUpdateTicks();
 
@@ -1614,17 +1407,9 @@ void main(void)
 
         if (globalUpdateTicks == 0u) {
 
-            /*
-             * 全体輝度用の間欠カオスを
-             * 1ステップ進める。
-             */
             advanceChaos(&globalChaosValue);
 
 
-            /*
-             * 次の更新タイミングを
-             * ランダムに設定。
-             */
             globalUpdateTicks =
                 getNextGlobalUpdateTicks();
 
@@ -1634,16 +1419,8 @@ void main(void)
 
 
         /*
-         * ----------------------------------------------------
-         * PWM目標値更新
-         * ----------------------------------------------------
-         *
-         * 逆相カオスまたは全体カオスの
-         * どちらかが更新された場合のみ、
-         * 新しい目標Dutyを計算する。
-         *
-         * 両方が同じtickで更新された場合でも、
-         * calculateBrightness()は1回だけ実行する。
+         * どちらかのカオスが更新された場合、
+         * 新しいPWM目標値を計算する。
          */
         if (brightnessChanged) {
             calculateBrightness();
@@ -1651,18 +1428,15 @@ void main(void)
 
 
         /*
-         * ----------------------------------------------------
+         * ====================================================
          * 起動フェードイン
-         * ----------------------------------------------------
+         * ====================================================
          *
-         * 約2.1秒かけて
+         * 約2.1秒で
          *
          * 0% -> 通常輝度
          *
-         * へ上げる。
-         *
-         * フェード中でも2種類のカオスは
-         * バックグラウンドで更新される。
+         * へ変化する。
          */
 
         if (fadeTicks < 128u) {
@@ -1675,9 +1449,21 @@ void main(void)
 
 
             /*
-             * targetDuty * fadeTicks / 128
+             * targetDuty:
              *
-             * /128なのでシフト演算で処理。
+             * 最大1023
+             *
+             * fadeTicks:
+             *
+             * 最大128
+             *
+             * 最大積:
+             *
+             * 1023 * 128
+             * = 130944
+             *
+             * uint16_tを超えるため、
+             * 必ずuint32_tで乗算する。
              */
             out5 =
                 (uint16_t)(
@@ -1710,10 +1496,7 @@ void main(void)
 
             /*
              * フェード終了後は、
-             * どちらかの揺らぎ値が変わったときだけ
-             * PWMレジスタを書き換える。
-             *
-             * 無駄なCPU処理を減らす。
+             * 揺らぎが変化した場合のみPWMを書き換える。
              */
             if (brightnessChanged) {
 
