@@ -27,12 +27,38 @@
  * 2SK4017 Gate-GND : 100kR pull-down
  *
  * LED:
- * +4.5V -> current limiting resistor(75ohm) -> LED(OSM2DK5111A-UV) -> 2SK4017 Drain
+ * +4.5V -> current limiting resistor(75ohm)
+ *       -> LED(OSM2DK5111A-UV)
+ *       -> 2SK4017 Drain
+ *
  * 2SK4017 Source -> GND
  *
  * ------------------------------------------------------------
  * Flicker algorithm
  * ------------------------------------------------------------
+ *
+ * 2種類の間欠カオスを使用する。
+ *
+ * Chaos 1:
+ *
+ *   LED CH1 / CH2の逆相揺らぎ。
+ *
+ *   片方が明るくなると、
+ *   もう片方が暗くなる。
+ *
+ *   炎の中で明るい位置が移動するような
+ *   局所的な揺らぎを表現する。
+ *
+ *
+ * Chaos 2:
+ *
+ *   2灯共通の全体輝度揺らぎ。
+ *
+ *   CH1 / CH2の逆相関係を維持したまま、
+ *   ランタン全体を明るくしたり暗くしたりする。
+ *
+ *   炎そのものの強弱を表現する。
+ *
  *
  * LEDの揺らぎ生成部分は以下の記事で紹介されている
  * 間欠カオスを用いた手法をベースにしている。
@@ -47,6 +73,7 @@
  * ・delay()を使用しない
  * ・CPUは待機中Idleモードへ移行
  * ・不要な周辺モジュールをPMDで停止
+ * ・逆相揺らぎとは独立した全体輝度用カオスを追加
  *
  * ============================================================
  */
@@ -121,20 +148,71 @@
 // ============================================================
 
 /*
- * 揺らぎの深さ
+ * ------------------------------------------------------------
+ * LED1 / LED2間の逆相揺らぎの深さ
+ * ------------------------------------------------------------
  *
  * 元Arduino版:
+ *
  *   dimming_range = 50
  *
  * と同じ。
  *
- * 大きくすると明暗差が大きくなる。
+ * FLICKER_DEPTH = 50 の場合、
+ *
+ * CH1:
+ *   205 ～ 255
+ *
+ * CH2:
+ *   255 ～ 205
+ *
+ * の範囲で逆方向に変化する。
+ *
+ * 大きくすると、
+ * 2つのLED間の明暗差が大きくなる。
  */
-#define FLICKER_DEPTH          50u
+#define FLICKER_DEPTH              50u
 
 
 /*
- * 全体の明るさ
+ * ------------------------------------------------------------
+ * ランタン全体の揺らぎの最小輝度
+ * ------------------------------------------------------------
+ *
+ * Q8形式:
+ *
+ * 256 = 100%
+ * 230 = 約90%
+ * 205 = 約80%
+ * 180 = 約70%
+ * 154 = 約60%
+ *
+ * 初期設定では、
+ *
+ *   約70% ～ 100%
+ *
+ * の範囲でランタン全体を揺らす。
+ *
+ * 暗すぎる場合:
+ *   190～210程度へ上げる。
+ *
+ * 揺らぎが弱い場合:
+ *   160～170程度へ下げる。
+ */
+#define GLOBAL_BRIGHTNESS_MIN_Q8   180u
+
+/*
+ * 全体揺らぎの最大輝度。
+ *
+ * 256 = 100%
+ */
+#define GLOBAL_BRIGHTNESS_MAX_Q8   256u
+
+
+/*
+ * ------------------------------------------------------------
+ * 全体の最大明るさ
+ * ------------------------------------------------------------
  *
  * 256 = 100%
  * 192 =  75%
@@ -146,11 +224,13 @@
  *
  * 最初は100%で実物を確認する。
  */
-#define MASTER_BRIGHTNESS_Q8   256u
+#define MASTER_BRIGHTNESS_Q8       256u
 
 
 /*
+ * ------------------------------------------------------------
  * 間欠カオスのthreshold
+ * ------------------------------------------------------------
  *
  * 元Arduino版:
  *
@@ -160,21 +240,23 @@
  *
  * 0.065 * 32768 ≒ 2130
  */
-#define CHAOS_THRESHOLD        2130u
+#define CHAOS_THRESHOLD            2130u
 
-#define Q15_ONE                32768UL
-#define Q15_HALF               16384u
+#define Q15_ONE                    32768UL
+#define Q15_HALF                   16384u
 
 
 /*
+ * ------------------------------------------------------------
  * 擬似乱数初期値
+ * ------------------------------------------------------------
  *
  * 2個のランタンに完全に同じプログラムを書き込むと、
  * 同時起動時に同じ揺らぎになる可能性がある。
  *
  * 2台目ではこの値を変更するとよい。
  */
-#define RNG_SEED               0xA531u
+#define RNG_SEED                   0xA531u
 
 
 // ============================================================
@@ -186,24 +268,55 @@
  *
  * 元Arduino版と同じテーブルを使用する。
  */
-
 static const uint8_t gamma8[256] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2,
-    2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5,
-    5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10,
-    10, 10, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 15, 15, 16, 16,
-    17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 24, 24, 25,
-    25, 26, 27, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36,
-    37, 38, 39, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50,
-    51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 66, 67, 68,
-    69, 70, 72, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89,
-    90, 92, 93, 95, 96, 98, 99, 101, 102, 104, 105, 107, 109, 110, 112, 114,
-    115, 117, 119, 120, 122, 124, 126, 127, 129, 131, 133, 135, 137, 138, 140, 142,
-    144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 167, 169, 171, 173, 175,
-    177, 180, 182, 184, 186, 189, 191, 193, 196, 198, 200, 203, 205, 208, 210, 213,
-    215, 218, 220, 223, 225, 228, 231, 233, 236, 239, 241, 244, 247, 249, 252, 255
+
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 1, 1, 1, 1,
+
+    1, 1, 1, 1, 1, 1, 1, 1,
+    1, 2, 2, 2, 2, 2, 2, 2,
+
+    2, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 5, 5, 5,
+
+    5, 6, 6, 6, 6, 7, 7, 7,
+    7, 8, 8, 8, 9, 9, 9, 10,
+
+    10, 10, 11, 11, 11, 12, 12, 13,
+    13, 13, 14, 14, 15, 15, 16, 16,
+
+    17, 17, 18, 18, 19, 19, 20, 20,
+    21, 21, 22, 22, 23, 24, 24, 25,
+
+    25, 26, 27, 27, 28, 29, 29, 30,
+    31, 32, 32, 33, 34, 35, 35, 36,
+
+    37, 38, 39, 39, 40, 41, 42, 43,
+    44, 45, 46, 47, 48, 49, 50, 50,
+
+    51, 52, 54, 55, 56, 57, 58, 59,
+    60, 61, 62, 63, 64, 66, 67, 68,
+
+    69, 70, 72, 73, 74, 75, 77, 78,
+    79, 81, 82, 83, 85, 86, 87, 89,
+
+    90, 92, 93, 95, 96, 98, 99, 101,
+    102, 104, 105, 107, 109, 110, 112, 114,
+
+    115, 117, 119, 120, 122, 124, 126, 127,
+    129, 131, 133, 135, 137, 138, 140, 142,
+
+    144, 146, 148, 150, 152, 154, 156, 158,
+    160, 162, 164, 167, 169, 171, 173, 175,
+
+    177, 180, 182, 184, 186, 189, 191, 193,
+    196, 198, 200, 203, 205, 208, 210, 213,
+
+    215, 218, 220, 223, 225, 228, 231, 233,
+    236, 239, 241, 244, 247, 249, 252, 255
 };
 
 
@@ -212,7 +325,9 @@ static const uint8_t gamma8[256] = {
 // ============================================================
 
 /*
- * 間欠カオス内部値。
+ * ------------------------------------------------------------
+ * 逆相揺らぎ用の間欠カオス内部値
+ * ------------------------------------------------------------
  *
  * Q15形式:
  *
@@ -220,9 +335,26 @@ static const uint8_t gamma8[256] = {
  * 16384 = 0.5
  * 32768 = 1.0
  *
- * 初期値0.10
+ * 初期値:
+ *
+ * 3277 / 32768 ≒ 0.10
  */
 static uint16_t chaosValue = 3277u;
+
+
+/*
+ * ------------------------------------------------------------
+ * 全体輝度用の間欠カオス内部値
+ * ------------------------------------------------------------
+ *
+ * 逆相カオスとは異なる初期状態から開始する。
+ *
+ * 10923 / 32768 ≒ 0.333
+ *
+ * 初期値をずらすことで、
+ * 2つの揺らぎが同期しにくくなる。
+ */
+static uint16_t globalChaosValue = 10923u;
 
 
 /*
@@ -254,7 +386,18 @@ static uint16_t rngState = RNG_SEED;
  *
  * 1 tick ≒ 16.384ms
  */
+
+
+/*
+ * 逆相揺らぎの次回更新までのtick数。
+ */
 static uint8_t updateTicks = 1u;
+
+
+/*
+ * 全体輝度揺らぎの次回更新までのtick数。
+ */
+static uint8_t globalUpdateTicks = 1u;
 
 
 /*
@@ -285,6 +428,7 @@ static uint16_t rand16(void)
     x ^= (uint16_t)(x >> 9);
     x ^= (uint16_t)(x << 8);
 
+
     /*
      * xorshiftは0が永久に0になるため、
      * 念のため0を回避する。
@@ -292,6 +436,7 @@ static uint16_t rand16(void)
     if (x == 0u) {
         x = 0xA531u;
     }
+
 
     rngState = x;
 
@@ -346,6 +491,7 @@ static void lockPPS(void)
  * PWM5 duty設定。
  *
  * duty10:
+ *
  *   0 ～ 1023
  */
 static void writePWM5(uint16_t duty10)
@@ -354,15 +500,22 @@ static void writePWM5(uint16_t duty10)
         duty10 = 1023u;
     }
 
+
     /*
      * PWM5DC[9:2]
      */
     PWM5DCH = (uint8_t)(duty10 >> 2);
 
+
     /*
      * PWM5DC[1:0]はDCLのbit7:6に格納
      */
-    PWM5DCL = (uint8_t)((duty10 & 0x03u) << 6);
+    PWM5DCL =
+        (uint8_t)(
+            (duty10 & 0x03u)
+            <<
+            6
+        );
 }
 
 
@@ -375,8 +528,15 @@ static void writePWM6(uint16_t duty10)
         duty10 = 1023u;
     }
 
+
     PWM6DCH = (uint8_t)(duty10 >> 2);
-    PWM6DCL = (uint8_t)((duty10 & 0x03u) << 6);
+
+    PWM6DCL =
+        (uint8_t)(
+            (duty10 & 0x03u)
+            <<
+            6
+        );
 }
 
 
@@ -387,29 +547,37 @@ static void writePWM6(uint16_t duty10)
 /*
  * 8bit brightness:
  *
- * 0 ～ 255
+ *   0 ～ 255
  *
  * を
  *
  * PWM 10bit:
  *
- * 0 ～ 1023
+ *   0 ～ 1023
  *
  * に変換する。
  *
  * 上位8bitをそのまま使用し、
  * 上位側のbitを下位2bitにも複製することで、
  *
- * 255 -> 1023
+ *   255 -> 1023
  *
  * になる。
  */
 static uint16_t brightnessToDuty10(uint8_t brightness)
 {
     return
-        ((uint16_t)brightness << 2)
+        (
+            (uint16_t)brightness
+            <<
+            2
+        )
         |
-        ((uint16_t)brightness >> 6);
+        (
+            (uint16_t)brightness
+            >>
+            6
+        );
 }
 
 
@@ -429,7 +597,12 @@ static uint8_t applyMasterBrightness(uint8_t brightness)
         *
         (uint16_t)MASTER_BRIGHTNESS_Q8;
 
-    return (uint8_t)(temp >> 8);
+    return
+        (uint8_t)(
+            temp
+            >>
+            8
+        );
 }
 
 
@@ -438,17 +611,39 @@ static uint8_t applyMasterBrightness(uint8_t brightness)
 // ============================================================
 
 /*
- * 現在のchaosValueから
- * 2つのLEDのPWM Dutyを求める。
+ * 2種類の間欠カオスからLED輝度を求める。
  *
- * CH1とCH2は逆方向に変化する。
  *
- * 片方が明るくなると、
- * もう片方が暗くなる。
+ * chaosValue:
+ *
+ *   LED CH1 / CH2の逆相揺らぎ。
+ *
+ *
+ * globalChaosValue:
+ *
+ *   ランタン全体の明暗揺らぎ。
+ *
+ *
+ * 処理順:
+ *
+ *  1. chaosValueからCH1/CH2の逆相輝度を求める
+ *
+ *  2. globalChaosValueから全体輝度係数を求める
+ *
+ *  3. 2灯に同じ全体輝度係数を掛ける
+ *
+ *  4. gamma補正
+ *
+ *  5. MASTER_BRIGHTNESS
+ *
+ *  6. PWM Dutyへ変換
  */
 static void calculateBrightness(void)
 {
     uint16_t delta;
+
+    uint16_t globalRange;
+    uint16_t globalBrightnessQ8;
 
     uint8_t raw5;
     uint8_t raw6;
@@ -458,22 +653,31 @@ static void calculateBrightness(void)
 
 
     /*
+     * ========================================================
+     * Chaos 1
+     *
+     * LED1 / LED2の逆相揺らぎ
+     * ========================================================
+     *
      * chaosValue:
      *
-     * 0 ～ 32768
+     *   0 ～ 32768
      *
      * を
      *
-     * 0 ～ FLICKER_DEPTH
+     *   0 ～ FLICKER_DEPTH
      *
      * に変換する。
      */
     delta =
         (uint16_t)(
-            ((uint32_t)chaosValue
-             *
-             (uint32_t)FLICKER_DEPTH)
-            >> 15
+            (
+                (uint32_t)chaosValue
+                *
+                (uint32_t)FLICKER_DEPTH
+            )
+            >>
+            15
         );
 
 
@@ -489,6 +693,23 @@ static void calculateBrightness(void)
      *   - value * dimming_range;
      *
      * と同じ。
+     *
+     *
+     * FLICKER_DEPTH = 50の場合:
+     *
+     * raw5:
+     *
+     *   205 ～ 255
+     *
+     * raw6:
+     *
+     *   255 ～ 205
+     *
+     * となる。
+     *
+     * 2灯の合計は一定なので、
+     * この段階ではランタン全体の光量は
+     * ほぼ一定となる。
      */
     raw5 =
         (uint8_t)(
@@ -499,11 +720,101 @@ static void calculateBrightness(void)
             delta
         );
 
+
     raw6 =
         (uint8_t)(
             255u
             -
             delta
+        );
+
+
+    /*
+     * ========================================================
+     * Chaos 2
+     *
+     * ランタン全体の明暗揺らぎ
+     * ========================================================
+     *
+     * globalChaosValue:
+     *
+     *   0 ～ 32768
+     *
+     * を
+     *
+     * GLOBAL_BRIGHTNESS_MIN_Q8
+     *
+     *       ～
+     *
+     * GLOBAL_BRIGHTNESS_MAX_Q8
+     *
+     * に変換する。
+     *
+     *
+     * 初期設定:
+     *
+     *   180 ～ 256
+     *
+     *   ≒ 70 ～ 100%
+     */
+    globalRange =
+        (uint16_t)(
+            GLOBAL_BRIGHTNESS_MAX_Q8
+            -
+            GLOBAL_BRIGHTNESS_MIN_Q8
+        );
+
+
+    globalBrightnessQ8 =
+        (uint16_t)(
+            GLOBAL_BRIGHTNESS_MIN_Q8
+            +
+            (
+                (
+                    (uint32_t)globalChaosValue
+                    *
+                    (uint32_t)globalRange
+                )
+                >>
+                15
+            )
+        );
+
+
+    /*
+     * 逆相関係を維持したまま、
+     * CH1 / CH2の両方に
+     * 同じ全体輝度係数を掛ける。
+     *
+     * globalBrightnessQ8 = 256:
+     *
+     *   100%
+     *
+     * globalBrightnessQ8 = 180:
+     *
+     *   約70%
+     */
+    raw5 =
+        (uint8_t)(
+            (
+                (uint32_t)raw5
+                *
+                (uint32_t)globalBrightnessQ8
+            )
+            >>
+            8
+        );
+
+
+    raw6 =
+        (uint8_t)(
+            (
+                (uint32_t)raw6
+                *
+                (uint32_t)globalBrightnessQ8
+            )
+            >>
+            8
         );
 
 
@@ -515,7 +826,7 @@ static void calculateBrightness(void)
 
 
     /*
-     * 全体輝度設定を反映
+     * 全体の最大輝度設定を反映
      */
     gamma5 = applyMasterBrightness(gamma5);
     gamma6 = applyMasterBrightness(gamma6);
@@ -536,23 +847,46 @@ static void calculateBrightness(void)
 /*
  * 間欠カオスの状態を1ステップ進める。
  *
+ * value:
+ *
+ * Q15形式:
+ *
+ * 0     = 0.0
+ * 16384 = 0.5
+ * 32768 = 1.0
+ *
+ *
  * 元Arduino版:
  *
  * if (value < 0.5) {
- *     value += 2 * value * value;
+ *
+ *     value +=
+ *         2 * value * value;
  * }
  * else {
- *     value -= 2 * (1-value) * (1-value);
+ *
+ *     value -=
+ *         2 * (1-value) * (1-value);
  * }
  *
- * をQ15整数演算で実装。
+ *
+ * この関数を、
+ *
+ * ・逆相揺らぎ
+ * ・全体輝度揺らぎ
+ *
+ * の両方から使用する。
  */
-static void updateChaos(void)
+static void advanceChaos(uint16_t *value)
 {
     uint32_t square;
+    uint16_t x;
 
 
-    if (chaosValue < Q15_HALF) {
+    x = *value;
+
+
+    if (x < Q15_HALF) {
 
         /*
          * value += 2 * value^2
@@ -568,16 +902,22 @@ static void updateChaos(void)
          * となる。
          */
         square =
-            (uint32_t)chaosValue
+            (uint32_t)x
             *
-            (uint32_t)chaosValue;
+            (uint32_t)x;
 
-        chaosValue +=
-            (uint16_t)(square >> 14);
+
+        x +=
+            (uint16_t)(
+                square
+                >>
+                14
+            );
     }
     else {
 
         uint16_t t;
+
 
         /*
          * t = 1 - value
@@ -586,16 +926,22 @@ static void updateChaos(void)
             (uint16_t)(
                 Q15_ONE
                 -
-                chaosValue
+                x
             );
+
 
         square =
             (uint32_t)t
             *
             (uint32_t)t;
 
-        chaosValue -=
-            (uint16_t)(square >> 14);
+
+        x -=
+            (uint16_t)(
+                square
+                >>
+                14
+            );
     }
 
 
@@ -604,10 +950,10 @@ static void updateChaos(void)
      * thresholdを超えたところで乱数を再注入する。
      */
     if (
-        (chaosValue <= CHAOS_THRESHOLD)
+        (x <= CHAOS_THRESHOLD)
         ||
         (
-            chaosValue
+            x
             >=
             (uint16_t)(
                 Q15_ONE
@@ -619,6 +965,7 @@ static void updateChaos(void)
 
         uint16_t range;
 
+
         range =
             (uint16_t)(
                 Q15_ONE
@@ -626,7 +973,8 @@ static void updateChaos(void)
                 (2UL * CHAOS_THRESHOLD)
             );
 
-        chaosValue =
+
+        x =
             CHAOS_THRESHOLD
             +
             (uint16_t)(
@@ -635,15 +983,13 @@ static void updateChaos(void)
                     *
                     (uint32_t)range
                 )
-                >> 16
+                >>
+                16
             );
     }
 
 
-    /*
-     * 新しいchaosValueからLEDの明るさを計算。
-     */
-    calculateBrightness();
+    *value = x;
 }
 
 
@@ -652,19 +998,27 @@ static void updateChaos(void)
 // ============================================================
 
 /*
- * 次の明るさ更新までの時間をランダム化する。
+ * ------------------------------------------------------------
+ * Chaos 1
+ *
+ * LED1 / LED2逆相揺らぎの更新時間
+ * ------------------------------------------------------------
  *
  * Timer2 interrupt tick:
  *
  * 約16.384ms
  *
+ *
  * 基本:
  *
  * 5～8 tick
+ *
  * ≒ 82～131ms
+ *
  *
  * さらに約1/3の確率で
  * 数tick追加する。
+ *
  *
  * 元Arduino版の
  *
@@ -679,11 +1033,11 @@ static void updateChaos(void)
 static uint8_t getNextUpdateTicks(void)
 {
     uint8_t ticks;
-
     uint16_t r;
 
 
     r = rand16();
+
 
     /*
      * 5 ～ 8 tick
@@ -700,7 +1054,15 @@ static uint8_t getNextUpdateTicks(void)
      * およそ1/3の確率で
      * 少し長く停止させる。
      */
-    if ((uint8_t)(rand16() & 0xFFu) < 85u) {
+    if (
+        (uint8_t)(
+            rand16()
+            &
+            0xFFu
+        )
+        <
+        85u
+    ) {
 
         /*
          * +3 ～ +10 tick
@@ -714,6 +1076,99 @@ static uint8_t getNextUpdateTicks(void)
                 (rand16() & 0x07u)
             );
     }
+
+
+    return ticks;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * Chaos 2
+ *
+ * ランタン全体の明暗更新時間
+ * ------------------------------------------------------------
+ *
+ * Timer2 interrupt tick:
+ *
+ * 約16.384ms
+ *
+ *
+ * 基本:
+ *
+ * 4～7 tick
+ *
+ * ≒ 66～115ms
+ *
+ *
+ * 約1/4の確率で:
+ *
+ * +2～5 tick
+ *
+ * ≒ 33～82ms追加
+ *
+ *
+ * 最大:
+ *
+ * 12 tick
+ *
+ * ≒ 197ms
+ *
+ *
+ * 1回の更新が1つの山・谷ではなく、
+ * 間欠カオスの状態が複数回連続して変化することで
+ * 短い山と谷が形成される。
+ *
+ * 逆相揺らぎとは別のタイミングで更新するため、
+ * 2つの揺らぎは同期しない。
+ */
+static uint8_t getNextGlobalUpdateTicks(void)
+{
+    uint8_t ticks;
+    uint16_t r;
+
+
+    r = rand16();
+
+
+    /*
+     * 4 ～ 7 tick
+     */
+    ticks =
+        (uint8_t)(
+            4u
+            +
+            (r & 0x03u)
+        );
+
+
+    /*
+     * 約1/4の確率で
+     * 少し長くその明るさを保持する。
+     */
+    if (
+        (uint8_t)(
+            rand16()
+            &
+            0xFFu
+        )
+        <
+        64u
+    ) {
+
+        /*
+         * +2 ～ +5 tick
+         *
+         * 約33～82ms追加
+         */
+        ticks +=
+            (uint8_t)(
+                2u
+                +
+                (rand16() & 0x03u)
+            );
+    }
+
 
     return ticks;
 }
@@ -918,11 +1373,13 @@ static void initPWM(void)
      * Datasheet推奨のPWM初期化手順。
      *
      * Postscalerが1:16なので
-     * 約16ms待つことになるが、起動時だけなので問題ない。
+     * 約16ms待つことになるが、
+     * 起動時だけなので問題ない。
      */
     while (PIR1bits.TMR2IF == 0) {
         ;
     }
+
 
     PIR1bits.TMR2IF = 0;
 
@@ -982,7 +1439,8 @@ static void initPWM(void)
      * GIEは0のまま。
      *
      * これによりTimer2 interrupt requestでIdleから復帰するが、
-     * ISRへは飛ばず、SLEEP()の次の命令から処理を再開する。
+     * ISRへは飛ばず、
+     * SLEEP()の次の命令から処理を再開する。
      */
     INTCONbits.GIE = 0;
 }
@@ -1030,6 +1488,9 @@ void main(void)
 
     /*
      * 初期の明るさを計算。
+     *
+     * chaosValueとglobalChaosValueの
+     * 両方の初期値がここで反映される。
      */
     calculateBrightness();
 
@@ -1041,9 +1502,19 @@ void main(void)
 
 
     /*
-     * 次回揺らぎ更新タイミングを決定。
+     * 逆相揺らぎの
+     * 次回更新タイミングを決定。
      */
-    updateTicks = getNextUpdateTicks();
+    updateTicks =
+        getNextUpdateTicks();
+
+
+    /*
+     * 全体輝度揺らぎの
+     * 次回更新タイミングを決定。
+     */
+    globalUpdateTicks =
+        getNextGlobalUpdateTicks();
 
 
     /*
@@ -1067,7 +1538,8 @@ void main(void)
          *
          * Timer2 / PWMはハードウェアで動作し続ける。
          *
-         * 約16.4ms後、Timer2 interrupt requestによって
+         * 約16.4ms後、
+         * Timer2 interrupt requestによって
          * CPUが再開する。
          */
         SLEEP();
@@ -1082,13 +1554,23 @@ void main(void)
         }
 
 
+        /*
+         * このtickで、
+         *
+         * ・逆相カオス
+         * ・全体カオス
+         *
+         * のどちらかが変化したかを示す。
+         */
         brightnessChanged = 0u;
 
 
         /*
-         * ----------------------------------------------------
-         * 揺らぎ更新タイミング
-         * ----------------------------------------------------
+         * ====================================================
+         * Chaos 1
+         *
+         * LED1 / LED2逆相揺らぎ
+         * ====================================================
          */
 
         if (updateTicks > 0u) {
@@ -1099,16 +1581,52 @@ void main(void)
         if (updateTicks == 0u) {
 
             /*
-             * 間欠カオスを1ステップ進め、
-             * 次のPWM Dutyを計算する。
+             * LED1 / LED2の逆相カオスを
+             * 1ステップ進める。
              */
-            updateChaos();
+            advanceChaos(&chaosValue);
 
 
             /*
-             * 次の更新タイミングをランダムに設定。
+             * 次の更新タイミングを
+             * ランダムに設定。
              */
-            updateTicks = getNextUpdateTicks();
+            updateTicks =
+                getNextUpdateTicks();
+
+
+            brightnessChanged = 1u;
+        }
+
+
+        /*
+         * ====================================================
+         * Chaos 2
+         *
+         * ランタン全体の明暗揺らぎ
+         * ====================================================
+         */
+
+        if (globalUpdateTicks > 0u) {
+            globalUpdateTicks--;
+        }
+
+
+        if (globalUpdateTicks == 0u) {
+
+            /*
+             * 全体輝度用の間欠カオスを
+             * 1ステップ進める。
+             */
+            advanceChaos(&globalChaosValue);
+
+
+            /*
+             * 次の更新タイミングを
+             * ランダムに設定。
+             */
+            globalUpdateTicks =
+                getNextGlobalUpdateTicks();
 
 
             brightnessChanged = 1u;
@@ -1117,10 +1635,34 @@ void main(void)
 
         /*
          * ----------------------------------------------------
+         * PWM目標値更新
+         * ----------------------------------------------------
+         *
+         * 逆相カオスまたは全体カオスの
+         * どちらかが更新された場合のみ、
+         * 新しい目標Dutyを計算する。
+         *
+         * 両方が同じtickで更新された場合でも、
+         * calculateBrightness()は1回だけ実行する。
+         */
+        if (brightnessChanged) {
+            calculateBrightness();
+        }
+
+
+        /*
+         * ----------------------------------------------------
          * 起動フェードイン
          * ----------------------------------------------------
          *
-         * 約2.1秒かけて0% -> 通常輝度へ上げる。
+         * 約2.1秒かけて
+         *
+         * 0% -> 通常輝度
+         *
+         * へ上げる。
+         *
+         * フェード中でも2種類のカオスは
+         * バックグラウンドで更新される。
          */
 
         if (fadeTicks < 128u) {
@@ -1144,8 +1686,10 @@ void main(void)
                         *
                         (uint32_t)fadeTicks
                     )
-                    >> 7
+                    >>
+                    7
                 );
+
 
             out6 =
                 (uint16_t)(
@@ -1154,7 +1698,8 @@ void main(void)
                         *
                         (uint32_t)fadeTicks
                     )
-                    >> 7
+                    >>
+                    7
                 );
 
 
@@ -1165,7 +1710,8 @@ void main(void)
 
             /*
              * フェード終了後は、
-             * 揺らぎ値が変わったときだけPWMレジスタを書き換える。
+             * どちらかの揺らぎ値が変わったときだけ
+             * PWMレジスタを書き換える。
              *
              * 無駄なCPU処理を減らす。
              */
